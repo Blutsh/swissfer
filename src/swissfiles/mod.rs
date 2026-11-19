@@ -5,7 +5,8 @@ use std::{fmt, path::PathBuf};
 mod swissfile;
 pub mod uploadparameters;
 use crate::{
-    api::{form_encode, patch, percent_decode, post, request, Method, Session},
+    altcha,
+    api::{form_encode, patch, percent_decode, request, Method, Session},
     email,
     errors::SwishError,
     swissfiles::swissfile::{RemoteSwissfile, Swissfile},
@@ -17,6 +18,10 @@ use self::uploadparameters::UploadParameters;
 
 pub const SWISSTRANSFER_BASE: &str = "https://www.swisstransfer.com";
 pub const SWISSTRANSFER_API: &str = "https://www.swisstransfer.com/api/1";
+
+/// The home page. Loading it starts a session, and its form is where guests open
+/// a transfer.
+const SWISSTRANSFER_HOME: &str = "https://www.swisstransfer.com/en";
 
 /// Cookie the site uses for its CSRF token. Laravel default name, renamed by Infomaniak.
 pub(crate) const XSRF_COOKIE: &str = "SWISSTRANSFER-API-XSRF-TOKEN";
@@ -82,13 +87,14 @@ fn link_url(link_uuid: &str) -> String {
     format!("{}/dl/{}", SWISSTRANSFER_BASE, link_uuid)
 }
 
-fn fetch_page(link_uuid: &str, session: &Session) -> Result<InertiaPage, SwishError> {
-    let url = link_url(link_uuid);
-    let response = request(&url, Method::Get, None, None, None, Some(session))?;
+fn fetch_page(url: &str, session: &Session) -> Result<InertiaPage, SwishError> {
+    let response = request(url, Method::Get, None, None, None, Some(session))?;
 
     match response.status {
         200 => InertiaPage::from_html(&response.text()),
-        404 => Err(SwishError::NotFound { url }),
+        404 => Err(SwishError::NotFound {
+            url: url.to_string(),
+        }),
         code => Err(SwishError::InvalidResponse {
             response: format!("{} for {}", code, url),
         }),
@@ -139,7 +145,7 @@ fn unlock(
     let page = if response.status == 200 && response.body.starts_with(b"{") {
         InertiaPage::from_json(&response.text())?
     } else {
-        fetch_page(link_uuid, session)?
+        fetch_page(&url, session)?
     };
 
     if page.component == "link/password" {
@@ -165,7 +171,7 @@ impl Swissfiles {
         log::debug!("Reading transfer {}", link_uuid);
 
         let session = Session::new();
-        let mut page = fetch_page(link_uuid, &session)?;
+        let mut page = fetch_page(&link_url(link_uuid), &session)?;
 
         if page.component == "link/password" {
             let password = password.ok_or(SwishError::PasswordRequired)?;
@@ -176,7 +182,7 @@ impl Swissfiles {
             println!("Waiting for security checks on Infomaniak's side...");
             std::io::stdout().flush().ok();
             std::thread::sleep(ANTIVIRUS_POLL);
-            page = fetch_page(link_uuid, &session)?;
+            page = fetch_page(&link_url(link_uuid), &session)?;
         }
 
         match page.component.as_str() {
@@ -247,17 +253,7 @@ impl Swissfiles {
 
         // Creating a transfer is CSRF-protected, so a page has to be loaded first to
         // pick up the session and token cookies.
-        let home = request(
-            &format!("{}/en", SWISSTRANSFER_BASE),
-            Method::Get,
-            None,
-            None,
-            None,
-            Some(&session),
-        )?;
-        let version = InertiaPage::from_html(&home.text())
-            .map(|page| page.version)
-            .unwrap_or_default();
+        let version = fetch_page(SWISSTRANSFER_HOME, &session)?.version;
 
         let email = upload_parameter
             .author_email
@@ -417,9 +413,9 @@ impl fmt::Display for Swissfiles {
 
 /// Ask SwissTransfer to open a transfer and hand back an id per file.
 ///
-/// The service protects this endpoint with Altcha, a proof-of-work and behavioural
-/// anti-bot challenge. This tool does not solve it: the field is sent empty and a
-/// rejection is reported as such.
+/// Guests do this by submitting the home page form, as the website does. The
+/// `/api/1/transfers` endpoint this used to call now only serves the mobile apps.
+/// The form wants an Altcha proof-of-work, solved afresh for every attempt.
 fn create_transfer(
     files: &[PathBuf],
     upload_parameter: &UploadParameters,
@@ -428,8 +424,6 @@ fn create_transfer(
     version: &str,
     session: &Session,
 ) -> Result<serde_json::Value, SwishError> {
-    let url = format!("{}/transfers", SWISSTRANSFER_API);
-
     let files_json: Vec<_> = files
         .iter()
         .filter(|file| file.is_file())
@@ -467,78 +461,76 @@ fn create_transfer(
         "max_download": upload_parameter.number_of_download,
         "expires_in_days": upload_parameter.duration,
         "files": files_json,
-        "altcha": "",
+        "altcha": altcha::solve(session)?,
         "email_validation_id": validation_id
     });
 
-    let mut headers = vec!["X-Requested-With: XMLHttpRequest".to_string()];
-    if !version.is_empty() {
-        headers.push(format!("X-Inertia-Version: {}", version));
-    }
+    let mut headers = vec![
+        "X-Requested-With: XMLHttpRequest".to_string(),
+        "X-Inertia: true".to_string(),
+        format!("X-Inertia-Version: {}", version),
+        "Accept: text/html, application/xhtml+xml".to_string(),
+    ];
     if let Some(token) = session.cookie(XSRF_COOKIE) {
         headers.push(format!("X-XSRF-TOKEN: {}", percent_decode(&token)));
     }
 
-    let response = post(
-        url.as_str(),
-        payload.to_string().into_bytes(),
+    let response = request(
+        SWISSTRANSFER_HOME,
+        Method::Post,
+        Some(payload.to_string().into_bytes()),
+        Some("application/json"),
         Some(headers),
         Some(session),
     )?;
 
-    let response_str = String::from_utf8_lossy(&response).into_owned();
-
-    let response_json: serde_json::Value =
-        serde_json::from_str(&response_str).map_err(|e| SwishError::InvalidJson {
-            json: format!(
-                "Failed to parse transfer JSON: {} - Response: {}",
-                e, response_str
-            ),
-        })?;
-
-    if response_json["result"] == "error" {
-        if rejected_field(&response_json, "altcha") {
-            return Err(SwishError::UploadBlocked);
-        }
-        if response_str.contains("verified_email_check_failed") {
-            return Err(SwishError::EmailValidationExpired);
-        }
-
-        return Err(SwishError::InvalidResponse {
-            response: describe_validation_errors(&response_json)
-                .unwrap_or_else(|| response_str.clone()),
-        });
+    // A stale sender confirmation can come back as a bare 401 instead of a form error.
+    if response.status == 401 && response.text().contains("email_not_verified") {
+        return Err(SwishError::EmailValidationExpired);
     }
 
-    // The payload sits under `data` when the API wraps it, and at the root otherwise.
-    if response_json["data"].is_object() {
-        Ok(response_json["data"].clone())
-    } else {
-        Ok(response_json)
+    // An accepted form answers with the next page. A refused one redirects, and the
+    // reasons wait in the session for whoever loads the page next.
+    let page = match response.status {
+        200 => InertiaPage::from_json(&response.text())?,
+        300..=399 => fetch_page(SWISSTRANSFER_HOME, session)?,
+        code => {
+            return Err(SwishError::InvalidResponse {
+                response: format!("{} - {}", code, response.text()),
+            })
+        }
+    };
+
+    let errors = &page.props["errors"];
+    if !errors["altcha"].is_null() {
+        return Err(SwishError::UploadBlocked);
+    }
+    if errors["email"]
+        .to_string()
+        .contains("verified_email_check_failed")
+    {
+        return Err(SwishError::EmailValidationExpired);
+    }
+
+    match &page.props["transfer"] {
+        transfer if transfer.is_object() => Ok(transfer.clone()),
+        _ => Err(SwishError::InvalidResponse {
+            response: describe_form_errors(errors)
+                .unwrap_or_else(|| "SwissTransfer did not open a transfer".to_string()),
+        }),
     }
 }
 
-/// Whether the server complained about one named field.
-fn rejected_field(response: &serde_json::Value, field: &str) -> bool {
-    response["error"]["errors"]
-        .as_array()
-        .map(|errors| {
-            errors
-                .iter()
-                .any(|error| error["context"]["attribute"] == field)
-        })
-        .unwrap_or(false)
-}
-
-/// Flatten the API's per-field validation errors into one readable line.
-fn describe_validation_errors(response: &serde_json::Value) -> Option<String> {
-    let errors = response["error"]["errors"].as_array()?;
-
+/// Flatten the form's per-field errors, `{"field": "message"}`, into one readable line.
+fn describe_form_errors(errors: &serde_json::Value) -> Option<String> {
     let described: Vec<String> = errors
+        .as_object()?
         .iter()
-        .map(|error| {
-            let field = error["context"]["attribute"].as_str().unwrap_or("request");
-            let message = error["description"].as_str().unwrap_or("rejected");
+        .map(|(field, message)| {
+            // Normally a plain string; anything else is shown as the JSON it came as.
+            let message = message
+                .as_str()
+                .map_or_else(|| message.to_string(), str::to_string);
             format!("{}: {}", field, message)
         })
         .collect();

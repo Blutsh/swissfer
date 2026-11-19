@@ -36,7 +36,7 @@ impl fmt::Display for SwishError {
             SwishError::TransferInfected => write!(f, "Infomaniak's antivirus flagged this transfer as infected, so it cannot be downloaded"),
             SwishError::CountryBlocked => write!(f, "This transfer is not available from your country"),
             SwishError::UnexpectedState { state } => write!(f, "SwissTransfer returned an unexpected page state: {}. The site may have changed again", state),
-            SwishError::UploadBlocked => write!(f, "Upload was rejected: SwissTransfer now protects transfer creation with an Altcha anti-bot challenge that this tool does not solve"),
+            SwishError::UploadBlocked => write!(f, "Upload was rejected: SwissTransfer did not accept the Altcha anti-bot proof, the service may have changed again"),
             SwishError::EmailRequired => write!(f, "SwissTransfer requires a sender address to upload. Pass one with the -e flag or --email flag"),
             SwishError::EmailValidationExpired => write!(f, "The saved confirmation for this address is no longer valid"),
         }

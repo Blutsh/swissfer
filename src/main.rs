@@ -3,6 +3,7 @@
 // I hope someone with no skill issues could refactor the wole code base and make it readable and maintainable.
 // Sorry for the mess x) at least it seems to work for now \o/
 
+mod altcha;
 mod api;
 mod email;
 mod errors;
