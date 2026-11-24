@@ -372,23 +372,71 @@ impl RemoteSwissfile {
 
         println!("Downloading {}", self.name);
 
-        let file = std::fs::File::create(&out_path)?;
+        const MAX_ATTEMPTS: u32 = 10;
+        let mut attempt = 1;
+        loop {
+            // Whatever is already on disk from an earlier run or attempt is kept and resumed.
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&out_path)?;
+            let offset = file.metadata()?.len();
 
-        let easy2 = new_easy2_download(url, None, file, self.size)?;
-        easy2.perform()?;
+            if offset == self.size {
+                println!("{} is already complete", self.name);
+                return Ok(());
+            }
+            if offset > self.size {
+                // Not a prefix of this file, start over.
+                file.set_len(0)?;
+                continue;
+            }
+            if offset > 0 {
+                println!("Resuming at {} of {} bytes", offset, self.size);
+            }
 
-        let status = easy2.response_code()?;
-        if status >= 400 {
-            // Clean up the file as it is invalid anyway
-            std::fs::remove_file(&out_path)?;
+            let easy2 = new_easy2_download(url.clone(), None, file, self.size, offset)?;
+            match easy2.perform() {
+                Ok(()) => {}
+                Err(e) if attempt < MAX_ATTEMPTS && is_retryable(&e) => {
+                    eprintln!("\n{} (attempt {}/{}), retrying...", e, attempt, MAX_ATTEMPTS);
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_secs(2 * attempt as u64));
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("\nPartial download kept at {}, run the same command again to resume", out_path.display());
+                    return Err(e.into());
+                }
+            }
 
-            return Err(SwishError::InvalidResponse {
-                response: format!("storage returned {} for {}", status, self.name),
-            });
+            let status = easy2.response_code()?;
+            if status >= 400 {
+                // Nothing of the error page was written, so only drop a file that is still empty.
+                if std::fs::metadata(&out_path)?.len() == 0 {
+                    std::fs::remove_file(&out_path)?;
+                }
+
+                return Err(SwishError::InvalidResponse {
+                    response: format!("storage returned {} for {}", status, self.name),
+                });
+            }
+
+            return Ok(());
         }
-
-        Ok(())
     }
+}
+
+/// Network hiccups worth another go; anything else (bad URL, disk full...) is final.
+fn is_retryable(e: &curl::Error) -> bool {
+    e.is_partial_file()
+        || e.is_recv_error()
+        || e.is_send_error()
+        || e.is_got_nothing()
+        || e.is_operation_timedout()
+        || e.is_couldnt_connect()
+        || e.is_couldnt_resolve_host()
+        || e.is_ssl_connect_error()
 }
 
 impl fmt::Display for Swissfile {

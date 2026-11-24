@@ -9,10 +9,23 @@ use indicatif::ProgressBar;
 pub struct DownloadHandler<W: Write> {
     pub writer: W,
     pub progress: Arc<Mutex<ProgressBar>>,
+    /// False while the latest status line is not 2xx, so error pages never land in the file.
+    pub ok: bool,
 }
 
 impl<W: Write> Handler for DownloadHandler<W> {
+    fn header(&mut self, data: &[u8]) -> bool {
+        if data.starts_with(b"HTTP/") {
+            let line = String::from_utf8_lossy(data);
+            self.ok = line.split_whitespace().nth(1).is_some_and(|c| c.starts_with('2'));
+        }
+        true
+    }
+
     fn write(&mut self, data: &[u8]) -> Result<usize, WriteError> {
+        if !self.ok {
+            return Ok(data.len());
+        }
         self.writer.write_all(data).map_err(|_| WriteError::Pause)?;
         self.progress.lock().unwrap().inc(data.len() as u64);
         Ok(data.len())

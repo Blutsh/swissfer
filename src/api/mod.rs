@@ -180,8 +180,10 @@ pub fn new_easy2_download(
     custom_headers: Option<Vec<String>>,
     file: File,
     file_size: u64,
+    offset: u64,
 ) -> Result<Easy2<DownloadHandler<File>>, curl::Error> {
     let progress_bar = ProgressBar::new(file_size);
+    progress_bar.set_position(offset);
     progress_bar.set_style(ProgressStyle::default_bar()
     .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})").unwrap()
     .progress_chars("#>-"));
@@ -189,6 +191,7 @@ pub fn new_easy2_download(
     let mut easy2 = Easy2::new(DownloadHandler {
         writer: file.try_clone().unwrap(), // Clone the file for the handler
         progress: Arc::new(Mutex::new(progress_bar)),
+        ok: false,
     });
 
     let mut merged_headers = default_headers();
@@ -205,6 +208,11 @@ pub fn new_easy2_download(
 
     easy2.url(&url)?;
     easy2.http_headers(headers)?;
+    // curl fails with a range error instead of appending if the server ignores the range.
+    easy2.resume_from(offset)?;
+    // Treat a stalled connection as an error so the caller can retry it.
+    easy2.low_speed_limit(1)?;
+    easy2.low_speed_time(std::time::Duration::from_secs(60))?;
 
     Ok(easy2)
 }
