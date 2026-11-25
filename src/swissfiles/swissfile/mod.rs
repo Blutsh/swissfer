@@ -11,7 +11,7 @@ use serde_json::json;
 use std::fmt;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::{Component, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 const CHUNK_SIZE: usize = 52428800;
@@ -359,9 +359,6 @@ impl RemoteSwissfile {
         custom_out_path: Option<&PathBuf>,
         session: &Session,
     ) -> Result<(), SwishError> {
-        let url = self.resolve_url(session)?;
-        log::debug!("Downloading {} from {}", self.name, url);
-
         let out_path = self.output_path(custom_out_path);
 
         if let Some(parent) = out_path.parent() {
@@ -370,25 +367,91 @@ impl RemoteSwissfile {
             }
         }
 
+        // Only a `.part` file is ever resumed, so a finished or unrelated file that
+        // happens to carry the same name is never mistaken for a partial download.
+        let mut part_path = out_path.clone().into_os_string();
+        part_path.push(".part");
+        let part_path = PathBuf::from(part_path);
+
         println!("Downloading {}", self.name);
 
-        let file = std::fs::File::create(&out_path)?;
+        const MAX_ATTEMPTS: u32 = 10;
+        let mut attempt = 1;
+        loop {
+            match self.download_attempt(&part_path, session) {
+                Ok(()) => break,
+                Err(SwishError::CurlError { error })
+                    if attempt < MAX_ATTEMPTS && is_retryable(&error) =>
+                {
+                    eprintln!("\n{} (attempt {}/{}), retrying...", error, attempt, MAX_ATTEMPTS);
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_secs(2 * attempt as u64));
+                }
+                Err(e) => {
+                    if std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0) > 0 {
+                        eprintln!("\nPartial download kept at {}, run the same command again to resume", part_path.display());
+                    } else {
+                        let _ = std::fs::remove_file(&part_path);
+                    }
+                    return Err(e);
+                }
+            }
+        }
 
-        let easy2 = new_easy2_download(url, None, file, self.size)?;
-        easy2.perform()?;
+        std::fs::rename(&part_path, &out_path)?;
+        Ok(())
+    }
 
+    /// One go at getting the file into `part_path`, continuing from what is already there.
+    fn download_attempt(&self, part_path: &Path, session: &Session) -> Result<(), SwishError> {
+        let offset = match std::fs::metadata(part_path) {
+            Ok(meta) if meta.len() <= self.size => meta.len(),
+            // Nothing there yet, or more than the whole file, which cannot be a prefix of it.
+            _ => 0,
+        };
+
+        if offset > 0 && offset == self.size {
+            // An earlier run got every byte and was stopped just before the rename.
+            return Ok(());
+        }
+
+        // Asked for on every attempt, because a retry can come after the hour the URL lasts.
+        let url = self.resolve_url(session)?;
+        log::debug!("Downloading {} from {}", self.name, url);
+
+        let file = if offset > 0 {
+            println!("Resuming at {} of {} bytes", offset, self.size);
+            std::fs::OpenOptions::new().append(true).open(part_path)?
+        } else {
+            File::create(part_path)?
+        };
+
+        let easy2 = new_easy2_download(url, None, file, self.size, offset)?;
+        let outcome = easy2.perform();
+
+        // Checked before curl's own verdict: a refused resume comes back as a range
+        // error, which would hide the status that explains it.
         let status = easy2.response_code()?;
         if status >= 400 {
-            // Clean up the file as it is invalid anyway
-            std::fs::remove_file(&out_path)?;
-
             return Err(SwishError::InvalidResponse {
                 response: format!("storage returned {} for {}", status, self.name),
             });
         }
 
-        Ok(())
+        Ok(outcome?)
     }
+}
+
+/// Network hiccups worth another go; anything else (bad URL, disk full...) is final.
+fn is_retryable(e: &curl::Error) -> bool {
+    e.is_partial_file()
+        || e.is_recv_error()
+        || e.is_send_error()
+        || e.is_got_nothing()
+        || e.is_operation_timedout()
+        || e.is_couldnt_connect()
+        || e.is_couldnt_resolve_host()
+        || e.is_ssl_connect_error()
 }
 
 impl fmt::Display for Swissfile {
